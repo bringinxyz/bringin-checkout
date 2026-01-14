@@ -8,6 +8,9 @@
   ],
   "scripts": {
     "build": "npm run build --workspaces",
+    "build:agent": "node scripts/build-agent.mjs",
+    "build:clean": "node scripts/build-agent.mjs --clean",
+    "build:full": "node scripts/build-agent.mjs --clean --typecheck --test",
     "test": "npm run test --workspaces --if-present",
     "lint": "npm run lint --workspaces --if-present",
     "clean": "npm run clean --workspaces --if-present",

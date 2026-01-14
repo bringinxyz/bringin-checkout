@@ -6,6 +6,8 @@ import { hasPaymentBeenReceived, markPaymentReceived } from './payment-state'
 import { is_preview_environment } from './preview'
 import { failure, success } from './types'
 import type { Result } from './types'
+import { createInvoiceFromLnAddress, getLightningAddress, eurToSats, satsToEur } from './bringin-provider.js'
+import { createSession } from './bringin-sessions.js'
 
 /**
  * Convert any string format to camelCase.
@@ -53,6 +55,16 @@ export async function getCheckout(checkoutId: string): Promise<Checkout> {
 
 export async function confirmCheckout(confirm: ConfirmCheckout): Promise<Checkout> {
   const client = createMoneyDevKitClient()
+  const lnAddress = getLightningAddress()
+
+  // Check if Bringin mode is enabled
+  if (lnAddress) {
+    log('Using Bringin LNURL-pay for checkout confirmation')
+    return await confirmCheckoutBringin(confirm, lnAddress)
+  }
+
+  // Fallback to LDK mode
+  log('Using LDK for checkout confirmation')
   const node = createMoneyDevKitNode()
   const confirmedCheckout = await client.checkouts.confirm(confirm)
 
@@ -67,6 +79,54 @@ export async function confirmCheckout(confirm: ConfirmCheckout): Promise<Checkou
     checkoutId: confirmedCheckout.id,
     nodeId: node.id,
     scid: invoice.scid,
+  })
+
+  return pendingPaymentCheckout
+}
+
+/**
+ * Confirm checkout using Bringin LNURL-pay
+ */
+async function confirmCheckoutBringin(confirm: ConfirmCheckout, lnAddress: string): Promise<Checkout> {
+  const client = createMoneyDevKitClient()
+  const confirmedCheckout = await client.checkouts.confirm(confirm)
+
+  // Convert sats to EUR using hard-coded rate
+  // The confirmed checkout has invoiceAmountSats set
+  const satsAmount = confirmedCheckout.invoiceAmountSats || 1000
+  const eurAmount = satsToEur(satsAmount)
+
+  // Generate LNURL-pay invoice via Bringin
+  const invoiceResult = await createInvoiceFromLnAddress(eurAmount, lnAddress)
+
+  if (invoiceResult.error) {
+    throw new Error(`Failed to create Bringin invoice: ${invoiceResult.error.message}`)
+  }
+
+  const bringinInvoice = invoiceResult.data
+  const expiryDate = bringinInvoice.expiresAt ? new Date(bringinInvoice.expiresAt) : new Date(Date.now() + 15 * 60 * 1000)
+
+  // Register invoice with MDK API
+  const pendingPaymentCheckout = await client.checkouts.registerInvoice({
+    paymentHash: bringinInvoice.paymentHash || bringinInvoice.bolt11.slice(0, 32),
+    invoice: bringinInvoice.bolt11,
+    invoiceExpiresAt: expiryDate,
+    checkoutId: confirmedCheckout.id,
+    nodeId: 'bringin-lnurl', // Use a placeholder node ID for Bringin
+    scid: '', // No SCID for LNURL-pay invoices
+  })
+
+  // Store session for verify polling
+  createSession({
+    checkoutId: confirmedCheckout.id,
+    lnAddress,
+    eurAmount,
+    sats: bringinInvoice.sats,
+    msats: bringinInvoice.msats,
+    bolt11: bringinInvoice.bolt11,
+    verifyUrl: bringinInvoice.verifyUrl,
+    paymentHash: bringinInvoice.paymentHash,
+    expiresAt: expiryDate,
   })
 
   return pendingPaymentCheckout
@@ -134,7 +194,18 @@ export async function createCheckout(
 
   try {
     const client = createMoneyDevKitClient()
-    const node = createMoneyDevKitNode()
+    const lnAddress = getLightningAddress()
+
+    // Determine node ID based on mode
+    let nodeId: string
+    if (lnAddress) {
+      log('Creating checkout in Bringin mode')
+      nodeId = 'bringin-lnurl'
+    } else {
+      const node = createMoneyDevKitNode()
+      nodeId = node.id
+    }
+
     const checkout = await client.checkouts.create(
       {
         amount,
@@ -150,10 +221,50 @@ export async function createCheckout(
         // Required customer fields - normalize to camelCase
         requireCustomerData: normalizeRequireCustomerData(params.requireCustomerData),
       },
-      node.id,
+      nodeId,
     )
 
     if (checkout.status === 'CONFIRMED') {
+      // Use Bringin provider if Lightning Address is configured
+      if (lnAddress) {
+        const satsAmount = checkout.invoiceAmountSats || 1000
+        const eurAmount = satsToEur(satsAmount)
+        const invoiceResult = await createInvoiceFromLnAddress(eurAmount, lnAddress)
+
+        if (invoiceResult.error) {
+          throw new Error(`Failed to create Bringin invoice: ${invoiceResult.error.message}`)
+        }
+
+        const bringinInvoice = invoiceResult.data
+        const expiryDate = bringinInvoice.expiresAt ? new Date(bringinInvoice.expiresAt) : new Date(Date.now() + 15 * 60 * 1000)
+
+        const pendingPaymentCheckout = await client.checkouts.registerInvoice({
+          paymentHash: bringinInvoice.paymentHash || bringinInvoice.bolt11.slice(0, 32),
+          invoice: bringinInvoice.bolt11,
+          invoiceExpiresAt: expiryDate,
+          checkoutId: checkout.id,
+          nodeId: 'bringin-lnurl',
+          scid: '', // No SCID for LNURL-pay invoices
+        })
+
+        // Store session for verify polling
+        createSession({
+          checkoutId: checkout.id,
+          lnAddress,
+          eurAmount,
+          sats: bringinInvoice.sats,
+          msats: bringinInvoice.msats,
+          bolt11: bringinInvoice.bolt11,
+          verifyUrl: bringinInvoice.verifyUrl,
+          paymentHash: bringinInvoice.paymentHash,
+          expiresAt: expiryDate,
+        })
+
+        return success({ checkout: pendingPaymentCheckout })
+      }
+
+      // Fallback to LDK mode
+      const node = createMoneyDevKitNode()
       const invoice = checkout.invoiceScid
         ? node.invoices.createWithScid(checkout.invoiceScid, checkout.invoiceAmountSats)
         : node.invoices.create(checkout.invoiceAmountSats)

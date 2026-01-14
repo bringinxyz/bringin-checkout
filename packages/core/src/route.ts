@@ -10,6 +10,7 @@ import { handlePayLNUrl } from './handlers/pay_ln_url'
 import { handlePing } from './handlers/ping'
 import { handleSyncRgs } from './handlers/sync_rgs'
 import { handleMdkWebhook } from './handlers/webhooks'
+import { handleVerifyStatus } from './handlers/bringin-verify.js'
 import { error, log } from './logging'
 
 export type RouteHandler = (request: Request) => Promise<Response>
@@ -32,8 +33,44 @@ const routeSchema = z.enum([
   'confirm_checkout',
   'pay_invoice',
   'sync_rgs',
+  'verify_status',
 ])
 export type UnifiedRoute = z.infer<typeof routeSchema>
+
+// Wrapper for verify_status handler
+async function handleVerifyStatusRoute(request: Request): Promise<Response> {
+  try {
+    const body = await request.json()
+    const checkoutId = body.checkoutId
+
+    if (!checkoutId) {
+      return new Response(JSON.stringify({ error: 'Missing checkoutId' }), {
+        status: 400,
+        headers: { 'content-type': 'application/json' },
+      })
+    }
+
+    const result = await handleVerifyStatus(checkoutId)
+
+    if (result.error) {
+      return new Response(JSON.stringify({ error: result.error.message }), {
+        status: 400,
+        headers: { 'content-type': 'application/json' },
+      })
+    }
+
+    return new Response(JSON.stringify(result.data), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    })
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err)
+    return new Response(JSON.stringify({ error: message }), {
+      status: 500,
+      headers: { 'content-type': 'application/json' },
+    })
+  }
+}
 
 const ROUTE_CONFIG: Record<UnifiedRoute, RouteConfig> = {
   webhook: { handler: handleMdkWebhook, auth: 'secret' },
@@ -49,6 +86,7 @@ const ROUTE_CONFIG: Record<UnifiedRoute, RouteConfig> = {
   confirm_checkout: { handler: handleConfirmCheckout, auth: 'csrf' },
   pay_invoice: { handler: handlePreviewPayInvoice, auth: 'csrf' },
   sync_rgs: { handler: handleSyncRgs, auth: 'secret' },
+  verify_status: { handler: handleVerifyStatusRoute, auth: 'csrf' },
 }
 
 const HANDLERS: Partial<Record<UnifiedRoute, RouteHandler>> = {}
